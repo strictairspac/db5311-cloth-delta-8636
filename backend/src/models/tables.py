@@ -38,3 +38,22 @@ audit = Table('audit_events', schema,
     Column('action', String(32), nullable=False),
     Column('reference', String(50), nullable=False),
     Column('created_at', String(32), nullable=False))
+# A quota version is one complete per-grade quota set. Versions take effect by date;
+# the highest version effective on or before the accounting date is selected.
+quota_versions = Table('quota_versions', schema,
+    Column('id', Integer, primary_key=True),
+    Column('version', Integer, nullable=False, unique=True),
+    Column('effective_date', String(10), nullable=False, index=True),
+    Column('quotas', JSON, nullable=False),
+    Column('author', String(40), nullable=False),
+    Column('created_at', String(32), nullable=False))
+# The whole quota set selected when a run is accepted is frozen onto the run.
+# Keeping it in its own table avoids altering the existing runs table in place.
+run_quota_pins = Table('run_quota_pins', schema,
+    Column('run_id', ForeignKey('business_runs.id'), primary_key=True),
+    Column('source', String(16), nullable=False),
+    Column('version', Integer),
+    Column('effective_date', String(10)),
+    Column('accounting_date', String(10)),
+    Column('quotas', JSON, nullable=False),
+    Column('created_at', String(32), nullable=False))

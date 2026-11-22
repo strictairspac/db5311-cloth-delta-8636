@@ -4,7 +4,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
 from src.config.settings import IS_MYSQL, engine
 from src.constants.workflow import Role
-from src.models.tables import audit, cases, evidence, runs, schema, users
+from src.models.tables import audit, cases, evidence, quota_versions, runs, schema, users
 from src.services.domain import SPEC
 from src.services.security import hash_password
 from src.utils.time import utc_time
@@ -24,9 +24,11 @@ def seed():
             keep_existing(conn, users, 'username', {'username': role.value, 'role': role.value,
                 'password_hash': hash_password('Demo-Walkthrough-2026')})
         keep_existing(conn, cases, 'slug', {'slug': 'demo', 'title': SPEC['name'],
-            'payload': SPEC['sample'], 'author': 'demo', 'created_at': utc_time()})
+            'payload': SPEC['dated_sample'], 'author': 'demo', 'created_at': utc_time()})
+        keep_existing(conn, quota_versions, 'version', {'version': 1, 'effective_date': '2026-11-01',
+            'quotas': SPEC['quota_sample'], 'author': 'demo', 'created_at': utc_time()})
         return {table.name: conn.execute(select(func.count()).select_from(table)).scalar_one()
-                for table in (users, cases, runs, evidence, audit)}
+                for table in (users, cases, runs, evidence, quota_versions, audit)}
 
 
 if __name__ == '__main__':

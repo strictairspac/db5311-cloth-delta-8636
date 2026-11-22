@@ -11,6 +11,7 @@ export function fields(sample, labels) {
       return `<label class="field data"><span>${label}</span>${columns ? `<small>${esc(columns)}</small>`:''}<textarea id="${field}" rows="${Math.max(4,Math.min(9,json.split('\n').length))}" spellcheck="false">${esc(json)}</textarea></label>`;
     }
     if (typeof value === 'boolean') return `<label class="field"><span>${label}</span><select id="${field}"><option value="true" ${value?'selected':''}>启用</option><option value="false" ${value?'':'selected'}>停用</option></select></label>`;
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return `<label class="field"><span>${label}</span><input id="${field}" type="date" value="${esc(value)}" required /></label>`;
     const type = typeof value === 'number' ? 'number' : 'text';
     return `<label class="field"><span>${label}</span><input id="${field}" type="${type}" ${type==='number'?'step="any"':''} value="${esc(value ?? '')}" required></label>`;
   }).join('');

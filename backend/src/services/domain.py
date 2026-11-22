@@ -2,7 +2,7 @@
 
 from collections import Counter
 
-from src.services import cloth_stock
+from src.services import cloth_stock, quota_versions
 from src.services.cloth_quota import warehouse_plan
 
 
@@ -15,11 +15,12 @@ SPEC = {
     'entity_labels': ['捐赠称重档案', '增量汇总运行', '仓位配额单'],
     'field_labels': {
         'opening_batches': '期初在库批次', 'revisions': '批次修订流水', 'quotas': '分级仓位配额',
+        'accounting_date': '核算日',
         'batch_id': '捐布批次', 'revision': '修订号', 'action': '修订动作', 'grade': '布料等级',
         'weight_g': '称重（克）', 'pieces': '件数', 'capacity_g': '重量上限（克）',
         'capacity_pieces': '件数上限',
     },
-    'guidance': '按收件顺序粘贴修订流水。记账填写完整新批次，撤销将等级留空并将重量、件数填为 0。',
+    'guidance': '按收件顺序粘贴修订流水。记账填写完整新批次，撤销将等级留空并将重量、件数填为 0。核算日用于选择当时生效的配额版本；旧档案可随档保存整套配额。',
     'sample': {
         'opening_batches': [
             {'batch_id': 'BL-101', 'revision': 1, 'grade': 'A级', 'weight_g': 18000, 'pieces': 12},
@@ -44,6 +45,31 @@ SPEC = {
             {'grade': 'D级', 'capacity_g': 5000, 'capacity_pieces': 4},
         ],
     },
+    'dated_sample': {
+        'opening_batches': [
+            {'batch_id': 'BL-101', 'revision': 1, 'grade': 'A级', 'weight_g': 18000, 'pieces': 12},
+            {'batch_id': 'BL-102', 'revision': 1, 'grade': 'A级', 'weight_g': 12000, 'pieces': 8},
+            {'batch_id': 'BL-201', 'revision': 1, 'grade': 'B级', 'weight_g': 16000, 'pieces': 11},
+            {'batch_id': 'BL-301', 'revision': 1, 'grade': 'C级', 'weight_g': 9000, 'pieces': 6},
+            {'batch_id': 'BL-501', 'revision': 1, 'grade': 'D级', 'weight_g': 3000, 'pieces': 2},
+        ],
+        'revisions': [
+            {'batch_id': 'BL-101', 'revision': 3, 'action': BOOK, 'grade': 'B级', 'weight_g': 20000, 'pieces': 13},
+            {'batch_id': 'BL-101', 'revision': 2, 'action': BOOK, 'grade': 'A级', 'weight_g': 17500, 'pieces': 11},
+            {'batch_id': 'BL-101', 'revision': 3, 'action': BOOK, 'grade': 'B级', 'weight_g': 20000, 'pieces': 13},
+            {'batch_id': 'BL-201', 'revision': 2, 'action': CANCEL, 'grade': '', 'weight_g': 0, 'pieces': 0},
+            {'batch_id': 'BL-301', 'revision': 2, 'action': BOOK, 'grade': 'C级', 'weight_g': 7000, 'pieces': 6},
+            {'batch_id': 'BL-401', 'revision': 1, 'action': BOOK, 'grade': 'A级', 'weight_g': 8000, 'pieces': 5},
+            {'batch_id': 'BL-501', 'revision': 2, 'action': CANCEL, 'grade': '', 'weight_g': 0, 'pieces': 0},
+        ],
+        'accounting_date': '2026-11-21',
+    },
+    'quota_sample': [
+        {'grade': 'A级', 'capacity_g': 23000, 'capacity_pieces': 12},
+        {'grade': 'B级', 'capacity_g': 17000, 'capacity_pieces': 15},
+        {'grade': 'C级', 'capacity_g': 10000, 'capacity_pieces': 8},
+        {'grade': 'D级', 'capacity_g': 5000, 'capacity_pieces': 4},
+    ],
     'expect': {'生效修订数': 5, '重复修订数': 1, '过期修订数': 1, '库存差异等级数': 0, '建议转裁批次数': 2},
 }
 
@@ -84,7 +110,6 @@ def validate(payload):
         raise ValueError('业务输入须为对象')
     batch_keys = {'batch_id', 'revision', 'grade', 'weight_g', 'pieces'}
     opening_ids = set()
-    quota_grades = set()
     for name, keys in [('opening_batches', batch_keys), ('revisions', batch_keys | {'action'})]:
         for location, row in _records(payload, name, keys):
             _identifier(row['batch_id'], '批次号', location)
@@ -102,11 +127,20 @@ def validate(payload):
             elif (row['grade'], row['weight_g'], row['pieces']) != ('', 0, 0):
                 raise ValueError(f'{location}撤销时等级须留空，重量与件数须为 0')
 
-    for location, row in _records(payload, 'quotas', {'grade', 'capacity_g', 'capacity_pieces'}):
-        _identifier(row['grade'], '等级', location)
-        _unique(row['grade'], quota_grades, location)
-        _integer(row, 'capacity_g', 0, location)
-        _integer(row, 'capacity_pieces', 0, location)
+    has_date = 'accounting_date' in payload
+    has_quotas = 'quotas' in payload
+    if not has_date and not has_quotas:
+        raise ValueError('档案须提供核算日以选用配额版本，或随档保存整套分级仓位配额')
+    if has_date:
+        try:
+            quota_versions.check_date(payload['accounting_date'])
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
+    if has_quotas:
+        try:
+            quota_versions.validate_quotas(payload['quotas'])
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
 
 
 def _audit_row(index, event, status, retracted, added):
@@ -119,12 +153,13 @@ def _audit_row(index, event, status, retracted, added):
     return row
 
 
-def _conflict_report(index, event, stored, audit):
+def _conflict_report(index, event, stored, audit, pin):
     identity = f"{event['batch_id']} 第 {event['revision']} 版"
     return {
         'summary': f'{identity}出现不同内容，暂停本次仓位与转裁发单。',
-        'metrics': {'版本冲突数': 1, '首个冲突流水行': index},
+        'metrics': {'版本冲突数': 1, '首个冲突流水行': index, '配额版本': quota_versions.label(pin)},
         'sections': [
+            quota_versions.section(pin),
             {'title': '版本冲突', 'rows': [
                 {'来源': source, '批次': row['batch_id'], '修订号': row['revision'], '动作': row['action'],
                  '等级': row['grade'], '重量（克）': row['weight_g'], '件数': row['pieces']}
@@ -135,18 +170,26 @@ def _conflict_report(index, event, stored, audit):
     }
 
 
-def solve(payload, engine):
+def solve(payload, engine, pin=None):
+    """Run the domain over one frozen quota snapshot.
+
+    ``pin`` is the quota set accepted with the run. Execution never reads the live
+    version table, so switching versions during acceptance cannot mix limits.
+    Callers that omit the pin resolve it once at the start of this run instead.
+    """
     validate(payload)
     audit = []
     counts = Counter()
     with engine.begin() as conn:
+        if pin is None:
+            pin = quota_versions.freeze(conn, payload)
         cloth_stock.initialize(conn)
         for row in payload['opening_batches']:
             cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
         for index, event in enumerate(payload['revisions'], 1):
             status, retracted, added = cloth_stock.apply_revision(conn, event)
             if status == '版本冲突':
-                return _conflict_report(index, event, retracted, audit)
+                return _conflict_report(index, event, retracted, audit, pin)
             counts[status] += 1
             audit.append(_audit_row(index, event, status, retracted, added))
 
@@ -165,17 +208,26 @@ def solve(payload, engine):
             ]},
             {'title': '批次修订轨迹', 'rows': audit},
         ]
+        if pin['source'] == quota_versions.SOURCE_NONE:
+            sections.append(quota_versions.section(pin))
+            metrics['配额版本'] = quota_versions.label(pin)
+            return {'summary': '核算日没有已生效的配额版本，暂不出具仓位配额单。',
+                    'metrics': metrics, 'sections': sections}
         if differences:
+            sections.append(quota_versions.section(pin))
+            metrics['配额版本'] = quota_versions.label(pin)
             return {'summary': f'{differences} 个等级库存存在差异，暂停本次仓位与转裁发单。',
                     'metrics': metrics, 'sections': sections}
         active_batches = conn.execute(cloth_stock.ACTIVE_BATCHES).mappings().all()
 
-    decisions, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, payload['quotas'])
-    metrics.update({'建议转裁批次数': len(cuts), '缺少配额等级数': missing_quotas})
+    decisions, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, pin['quotas'])
+    metrics.update({'建议转裁批次数': len(cuts), '缺少配额等级数': missing_quotas,
+                    '配额版本': quota_versions.label(pin)})
     sections[1:1] = [
         {'title': '分级仓位配额单', 'rows': decisions},
         {'title': '建议转裁批次', 'rows': cuts},
     ]
+    sections.append(quota_versions.section(pin))
     summary = f'库存全量对账一致，建议转裁 {len(cuts)} 批。'
     if missing_quotas:
         summary += f'{missing_quotas} 个等级缺少配额，暂停这些等级发单。'

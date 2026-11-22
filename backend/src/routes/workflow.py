@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
 from src.config.settings import cache, engine
 from src.controllers.workflow import download
 from src.models.tables import audit, cases, evidence, runs
-from src.schemas.workflow import CaseForm, LoginForm, ReviewForm
-from src.services import domain, workflow
+from src.schemas.workflow import CaseForm, LoginForm, QuotaVersionForm, ReviewForm
+from src.services import domain, quota_versions, workflow
 from src.services.security import current_user, login, operator, reviewer
 
 router = APIRouter()
@@ -29,6 +29,19 @@ def spec(_=Depends(current_user)):
     return domain.SPEC
 
 
+@router.get('/quota-versions')
+def list_quota_versions(_=Depends(current_user)):
+    return quota_versions.recent()
+
+
+@router.post('/quota-versions', status_code=201)
+def create_quota_version(form: QuotaVersionForm, actor=Depends(reviewer)):
+    try:
+        return quota_versions.create(form.effective_date, form.quotas, actor)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
 @router.get('/cases')
 def list_cases(_=Depends(current_user)):
     return workflow.recent(cases)
@@ -41,12 +54,17 @@ def create_case(form: CaseForm, actor=Depends(operator)):
 
 @router.get('/runs')
 def list_runs(_=Depends(current_user)):
-    return workflow.recent(runs)
+    return quota_versions.annotate(workflow.recent(runs))
 
 
 @router.post('/cases/{case_id}/runs', status_code=202)
 def start_run(case_id: int, actor=Depends(operator)):
-    return workflow.enqueue(case_id, actor)
+    return quota_versions.annotate([workflow.enqueue(case_id, actor)])[0]
+
+
+@router.post('/runs/{run_id}/retry', status_code=202)
+def retry_run(run_id: int, actor=Depends(operator)):
+    return quota_versions.annotate([workflow.retry(run_id, actor)])[0]
 
 
 @router.get('/evidence')

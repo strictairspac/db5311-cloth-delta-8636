@@ -8,7 +8,7 @@ import {go} from '../router/hash.js';
 export function editorPage(state, identity) {
   if (state.session.role!=='operator') return heading(topic.modules[1], '经办员可以建立并提交业务档案。');
   const original = state.cases.find(row=>row.id===identity);
-  const payload = original?.payload || state.spec.sample;
+  const payload = original?.payload || state.spec.dated_sample || state.spec.sample;
   state.draft = payload;
   return `${heading(topic.modules[1], state.spec.guidance)}
     <form id="case-form"><label class="field title-field"><span>档案名称</span><input name="title" required maxlength="120" value="${esc((original?.title || state.spec.name) + ' · 复核')}" /></label>

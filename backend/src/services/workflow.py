@@ -7,7 +7,7 @@ from sqlalchemy import and_, or_, select
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
 from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.services import domain, quota_versions
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -48,9 +48,14 @@ def make_case(title, payload, actor):
 
 def enqueue(case_id, actor):
     with engine.begin() as conn:
-        found(conn, cases, case_id)
+        payload = found(conn, cases, case_id)['payload']
+        # Freeze the whole quota set at acceptance in the same transaction as the
+        # run row. Later version switches, worker retries and re-claims all reuse
+        # this snapshot, so one slip can never mix limits from two versions.
+        pin = quota_versions.freeze(conn, payload)
         run_id = conn.execute(runs.insert().values(case_id=case_id, status=Status.QUEUED,
                               owner=actor, created_at=utc_time())).inserted_primary_key[0]
+        quota_versions.store(conn, run_id, pin)
         log(conn, actor, 'enqueue', run_id)
         result = found(conn, runs, run_id)
     try:
@@ -73,7 +78,11 @@ def claim():
         token = str(uuid.uuid4())
         conn.execute(runs.update().where(runs.c.id == run.id).values(
             started_at=utc_time(), status=Status.RUNNING, attempt_token=token))
-        return run.id, token, found(conn, cases, run.case_id)['payload']
+        payload = found(conn, cases, run.case_id)['payload']
+        # A retry or a run accepted before pinning existed gets one deterministic
+        # snapshot now, which every later retry reuses.
+        pin = quota_versions.ensure(conn, run.id, payload)
+        return run.id, token, payload, pin
 
 
 def finish(run_id, token, result=None, error=None):
@@ -88,6 +97,31 @@ def finish(run_id, token, result=None, error=None):
         if result is not None:
             conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
         log(conn, 'worker', status.value, run_id)
+
+
+def retry(run_id, actor):
+    """Re-queue a failed run without re-selecting its quota version.
+
+    The frozen snapshot accepted with the original run is kept untouched, so a
+    retry never switches to a version that became effective in the meantime.
+    """
+    with engine.begin() as conn:
+        run = found(conn, runs, run_id)
+        if run['status'] != Status.FAILED:
+            raise HTTPException(409, '只有执行失败的记录可以重试')
+        payload = found(conn, cases, run['case_id'])['payload']
+        quota_versions.ensure(conn, run_id, payload)
+        conn.execute(runs.update().where(runs.c.id == run_id).values(
+            status=Status.QUEUED, started_at=None, finished_at=None, error=None,
+            attempt_token=None))
+        log(conn, actor, 'retry', run_id)
+    try:
+        cache.lpush('worker:wake', 'queued')
+        cache.ltrim('worker:wake', 0, 99)
+    except Exception:
+        pass
+    with engine.connect() as conn:
+        return dict(conn.execute(select(runs).where(runs.c.id == run_id)).mappings().one())
 
 
 def review(identity, note, actor):
